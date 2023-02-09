@@ -323,3 +323,83 @@ func.func @iter_arg_memrefs(%in: memref<10xf32>) {
   }
   return
 }
+
+// CHECK-LABEL: @vector_simple
+func.func @vector_simple() {
+  %cst = arith.constant 0.000000e+00 : f32
+  %alloc = memref.alloc() {alignment = 64 : i64} : memref<50x256x40x32xf32>
+  // CHECK: affine.parallel
+  // CHECK:   affine.parallel
+  // CHECK:     affine.parallel
+  // CHECK:       affine.parallel
+  // CHECK:       }
+  affine.for %arg1 = 0 to 50 {
+    affine.for %arg2 = 0 to 256 {
+      affine.for %arg3 = 0 to 40 {
+        affine.for %arg4 = 0 to 32 step 16 {
+          %cst_0 = arith.constant dense<0.000000e+00> : vector<16xf32>
+          %cst_1 = arith.constant 0.000000e+00 : f32
+          %0 = vector.transfer_read %alloc[%arg1, %arg2, %arg3, %arg4], %cst_1 : memref<50x256x40x32xf32>, vector<16xf32>
+          %1 = arith.cmpf ugt, %0, %cst_0 : vector<16xf32>
+          %2 = arith.select %1, %0, %cst_0 : vector<16xi1>, vector<16xf32>
+          vector.transfer_write %2, %alloc[%arg1, %arg2, %arg3, %arg4] : vector<16xf32>, memref<50x256x40x32xf32>
+        }
+      }
+    }
+  }
+  return
+}
+
+// CHECK-LABEL: @vector_inner_not_parallel
+func.func @vector_inner_not_parallel() {
+  %cst = arith.constant 0.000000e+00 : f32
+  %alloc = memref.alloc() {alignment = 64 : i64} : memref<50x256x40x64xf32>
+  // CHECK: affine.parallel
+  // CHECK:   affine.parallel
+  // CHECK:     affine.parallel
+  // CHECK:       affine.for
+  // CHECK:       }
+  affine.for %arg1 = 0 to 50 {
+    affine.for %arg2 = 0 to 256 {
+      affine.for %arg3 = 0 to 40 {
+        affine.for %arg4 = 0 to 32 step 16 {
+          %cst_0 = arith.constant dense<0.000000e+00> : vector<16xf32>
+          %cst_1 = arith.constant 0.000000e+00 : f32
+          %0 = vector.transfer_read %alloc[%arg1, %arg2, %arg3, %arg4], %cst_1 : memref<50x256x40x64xf32>, vector<16xf32>
+          %1 = arith.cmpf ugt, %0, %cst_0 : vector<16xf32>
+          %2 = arith.select %1, %0, %cst_0 : vector<16xi1>, vector<16xf32>
+          %index = affine.apply affine_map<(d0) -> (d0 + 16)>(%arg4)
+          vector.transfer_write %2, %alloc[%arg1, %arg2, %arg3, %index] : vector<16xf32>, memref<50x256x40x64xf32>
+        }
+      }
+    }
+  }
+  return
+}
+
+// CHECK-LABEL: @vector_different_loop
+func.func @vector_different_loop() {
+  %cst = arith.constant 0.000000e+00 : f32
+  %alloc = memref.alloc() {alignment = 64 : i64} : memref<50x256x40x32xf32>
+  // CHECK: affine.parallel
+  // CHECK:   affine.parallel
+  // CHECK:     affine.parallel
+  // CHECK:       affine.parallel
+  // CHECK:       }
+  affine.for %arg1 = 0 to 50 {
+    affine.for %arg2 = 0 to 256 {
+      affine.for %arg3 = 0 to 40 {
+        %cst_1 = arith.constant 0.000000e+00 : f32
+        %c0 = arith.constant 0 : index
+        %0 = vector.transfer_read %alloc[%arg1, %arg2, %arg3, %c0], %cst_1 : memref<50x256x40x32xf32>, vector<16xf32>
+        affine.for %arg4 = 0 to 32 step 16 {
+          %cst_0 = arith.constant dense<0.000000e+00> : vector<16xf32>
+          %1 = arith.cmpf ugt, %0, %cst_0 : vector<16xf32>
+          %2 = arith.select %1, %0, %cst_0 : vector<16xi1>, vector<16xf32>
+          vector.transfer_write %2, %alloc[%arg1, %arg2, %arg3, %arg4] : vector<16xf32>, memref<50x256x40x32xf32>
+        }
+      }
+    }
+  }
+  return
+}

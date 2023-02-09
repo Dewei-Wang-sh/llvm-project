@@ -19,6 +19,7 @@
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/IntegerSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Debug.h"
@@ -1216,13 +1217,19 @@ MemRefAccess::MemRefAccess(Operation *loadOrStoreOpInst) {
     memref = loadOp.getMemRef();
     opInst = loadOrStoreOpInst;
     llvm::append_range(indices, loadOp.getMapOperands());
-  } else {
-    assert(isa<AffineWriteOpInterface>(loadOrStoreOpInst) &&
-           "Affine read/write op expected");
-    auto storeOp = cast<AffineWriteOpInterface>(loadOrStoreOpInst);
+  } else if (auto storeOp =
+                 dyn_cast<AffineWriteOpInterface>(loadOrStoreOpInst)) {
     opInst = loadOrStoreOpInst;
     memref = storeOp.getMemRef();
     llvm::append_range(indices, storeOp.getMapOperands());
+  } else if (auto vecOp =
+                 dyn_cast<VectorTransferOpInterface>(loadOrStoreOpInst)) {
+    opInst = loadOrStoreOpInst;
+    memref = vecOp.source();
+    llvm::append_range(indices, vecOp.indices());
+    llvm::append_range(accessRange, vecOp.getTransferChunkAccessed());
+  } else {
+    assert(0 && "affine.load/store or vector.transfer read/write op expected");
   }
 }
 
@@ -1231,7 +1238,8 @@ unsigned MemRefAccess::getRank() const {
 }
 
 bool MemRefAccess::isStore() const {
-  return isa<AffineWriteOpInterface>(opInst);
+  return isa<AffineWriteOpInterface>(opInst) ||
+         isa<vector::TransferWriteOp>(opInst);
 }
 
 /// Returns the nesting depth of this statement, i.e., the number of loops
@@ -1254,6 +1262,8 @@ unsigned mlir::getNestingDepth(Operation *op) {
 /// TODO: this does not account for aliasing of memrefs.
 bool MemRefAccess::operator==(const MemRefAccess &rhs) const {
   if (memref != rhs.memref)
+    return false;
+  if (accessRange != rhs.accessRange)
     return false;
 
   AffineValueMap diff, thisMap, rhsMap;

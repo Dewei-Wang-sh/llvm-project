@@ -1775,8 +1775,9 @@ void FlatAffineRelation::removeVarRange(VarKind kind, unsigned varStart,
     numRangeDims -= intersectRangeLHS - intersectRangeRHS;
 }
 
-LogicalResult mlir::getRelationFromMap(AffineMap &map,
-                                       FlatAffineRelation &rel) {
+LogicalResult
+mlir::getRelationFromMap(AffineMap &map, FlatAffineRelation &rel,
+                         const SmallVectorImpl<int64_t> &accessRange) {
   // Get flattened affine expressions.
   std::vector<SmallVector<int64_t, 8>> flatExprs;
   FlatAffineValueConstraints localVarCst;
@@ -1787,9 +1788,17 @@ LogicalResult mlir::getRelationFromMap(AffineMap &map,
   unsigned oldCols = localVarCst.getNumCols();
   unsigned numRangeVars = map.getNumResults();
   unsigned numDomainVars = map.getNumDims();
+  unsigned numDimSymLocalVars = oldCols - 1;
 
   // Add range as the new expressions.
   localVarCst.appendDimVar(numRangeVars);
+  if (!accessRange.empty()) {
+    unsigned count =
+        std::count_if(accessRange.begin(), accessRange.end(),
+                      [](int64_t range) -> bool { return range != 0; });
+    localVarCst.appendLocalVar(count);
+  }
+  unsigned numCols = localVarCst.getNumCols();
 
   // Add equalities between source and range.
   SmallVector<int64_t, 8> eq(localVarCst.getNumCols());
@@ -1803,7 +1812,27 @@ LogicalResult mlir::getRelationFromMap(AffineMap &map,
       eq[j + numRangeVars] = flatExprs[i][j];
     // Set this dimension to -1 to equate lhs and rhs and add equality.
     eq[numDomainVars + i] = -1;
+    if (!accessRange.empty() && accessRange[i] != 0)
+      eq[numDimSymLocalVars + i] = 1;
     localVarCst.addEquality(eq);
+  }
+
+  // Add inequalities of the local var
+  SmallVector<int64_t, 8> ineq(numCols, 0);
+  for (unsigned i = 0, j = 0, e = accessRange.size(); i < e; ++i) {
+    if (accessRange[i] == 0) {
+      break;
+    }
+    // Zero fill.
+    std::fill(ineq.begin(), ineq.end(), 0);
+    // Fill Inequality
+    ineq[numDimSymLocalVars + j] = 1;
+    ineq[numCols - 1] = 0;
+    localVarCst.addInequality(ineq);
+    ineq[numDimSymLocalVars + j] = -1;
+    ineq[numCols - 1] = accessRange[i] - 1;
+    localVarCst.addInequality(ineq);
+    j++;
   }
 
   // Create relation and return success.
@@ -1811,11 +1840,12 @@ LogicalResult mlir::getRelationFromMap(AffineMap &map,
   return success();
 }
 
-LogicalResult mlir::getRelationFromMap(const AffineValueMap &map,
-                                       FlatAffineRelation &rel) {
+LogicalResult
+mlir::getRelationFromMap(const AffineValueMap &map, FlatAffineRelation &rel,
+                         const SmallVectorImpl<int64_t> &accessRange) {
 
   AffineMap affineMap = map.getAffineMap();
-  if (failed(getRelationFromMap(affineMap, rel)))
+  if (failed(getRelationFromMap(affineMap, rel, accessRange)))
     return failure();
 
   // Set symbol values for domain dimensions and symbols.

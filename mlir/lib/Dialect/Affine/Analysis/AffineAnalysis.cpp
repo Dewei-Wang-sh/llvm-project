@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/AffineExprVisitor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IntegerSet.h"
@@ -147,6 +148,9 @@ bool mlir::isLoopMemoryParallel(AffineForOp forOp) {
     } else if (auto writeOp = dyn_cast<AffineWriteOpInterface>(op)) {
       // Filter out stores the same way as above.
       if (!isLocallyDefined(writeOp.getMemRef(), forOp))
+        loadAndStoreOps.push_back(op);
+    } else if (auto vecOp = dyn_cast<VectorTransferOpInterface>(op)) {
+      if (!isLocallyDefined(vecOp.source(), forOp))
         loadAndStoreOps.push_back(op);
     } else if (!isa<AffineForOp, AffineYieldOp, AffineIfOp>(op) &&
                !hasSingleEffect<MemoryEffects::Allocate>(op) &&
@@ -459,7 +463,7 @@ LogicalResult MemRefAccess::getAccessRelation(FlatAffineRelation &rel) const {
   // Get access relation from access map.
   AffineValueMap accessValueMap;
   getAccessMap(&accessValueMap);
-  if (failed(getRelationFromMap(accessValueMap, rel)))
+  if (failed(getRelationFromMap(accessValueMap, rel, accessRange)))
     return failure();
 
   FlatAffineRelation domainRel(rel.getNumDomainDims(), /*numRangeDims=*/0,
@@ -494,8 +498,13 @@ void MemRefAccess::getAccessMap(AffineValueMap *accessMap) const {
   AffineMap map;
   if (auto loadOp = dyn_cast<AffineReadOpInterface>(opInst))
     map = loadOp.getAffineMap();
-  else
-    map = cast<AffineWriteOpInterface>(opInst).getAffineMap();
+  else if (auto storeOp = dyn_cast<AffineWriteOpInterface>(opInst))
+    map = storeOp.getAffineMap();
+  else if (auto vecOp = dyn_cast<VectorTransferOpInterface>(opInst)) {
+    AffineMap permMap = vecOp.permutation_map();
+    map = AffineMap::getMultiDimIdentityMap(permMap.getNumDims(),
+                                            permMap.getContext());
+  }
 
   SmallVector<Value, 8> operands(indices.begin(), indices.end());
   fullyComposeAffineMapAndOperands(&map, &operands);
@@ -610,9 +619,13 @@ DependenceResult mlir::checkMemrefAccessDependence(
     return DependenceResult::Failure;
 
   // Return 'NoDependence' if one of these accesses is not an
-  // AffineWriteOpInterface.
-  if (!allowRAR && !isa<AffineWriteOpInterface>(srcAccess.opInst) &&
-      !isa<AffineWriteOpInterface>(dstAccess.opInst))
+  // AffineWriteOpInterface or vector::TransferWriteOp.
+  bool hasMemWriteEffect = isa<AffineWriteOpInterface>(srcAccess.opInst) ||
+                           isa<AffineWriteOpInterface>(dstAccess.opInst) ||
+                           isa<vector::TransferWriteOp>(srcAccess.opInst) ||
+                           isa<vector::TransferWriteOp>(dstAccess.opInst);
+
+  if (!allowRAR && !hasMemWriteEffect)
     return DependenceResult::NoDependence;
 
   // We can't analyze further if the ops lie in different affine scopes.

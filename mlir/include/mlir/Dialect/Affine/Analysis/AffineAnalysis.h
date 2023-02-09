@@ -81,6 +81,7 @@ struct MemRefAccess {
   Value memref;
   Operation *opInst;
   SmallVector<Value, 4> indices;
+  SmallVector<int64_t, 4> accessRange;
 
   /// Constructs a MemRefAccess from a load or store operation.
   // TODO: add accessors to standard op's load, store, DMA op's to return
