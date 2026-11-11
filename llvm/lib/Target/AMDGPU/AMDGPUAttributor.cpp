@@ -60,9 +60,16 @@ static constexpr std::pair<ImplicitArgumentMask, StringLiteral>
 static ImplicitArgumentMask
 intrinsicToAttrMask(Intrinsic::ID ID, bool &NonKernelOnly, bool &NeedsImplicit,
                     bool HasApertureRegs, bool SupportsGetDoorBellID,
-                    unsigned CodeObjectVersion) {
+                    bool HasArchitectedSGPRs, unsigned CodeObjectVersion) {
   switch (ID) {
   case Intrinsic::amdgcn_workitem_id_x:
+    NonKernelOnly = true;
+    return WORKITEM_ID_X;
+  case Intrinsic::amdgcn_wave_id:
+    // With architected SGPRs the wave ID is read from TTMP8. Otherwise it is
+    // computed from the X workitem ID.
+    if (HasArchitectedSGPRs)
+      return NOT_IMPLICIT_INPUT;
     NonKernelOnly = true;
     return WORKITEM_ID_X;
   case Intrinsic::amdgcn_workgroup_id_x:
@@ -556,6 +563,8 @@ struct AAAMDAttributesFunction : public AAAMDAttributes {
     bool HasApertureRegs = Features.test(AMDGPU::FEAT_APERTURE_REGS);
     bool SupportsGetDoorbellID = Features.test(AMDGPU::FEAT_GET_DOORBELL_ID);
     unsigned COV = InfoCache.getCodeObjectVersion();
+    bool HasArchitectedSGPRs =
+        InfoCache.TM.getSubtarget<GCNSubtarget>(*F).hasArchitectedSGPRs();
 
     for (Function *Callee : AAEdges->getOptimisticEdges()) {
       Intrinsic::ID IID = Callee->getIntrinsicID();
@@ -571,7 +580,8 @@ struct AAAMDAttributesFunction : public AAAMDAttributes {
       bool NonKernelOnly = false;
       ImplicitArgumentMask AttrMask =
           intrinsicToAttrMask(IID, NonKernelOnly, NeedsImplicit,
-                              HasApertureRegs, SupportsGetDoorbellID, COV);
+                              HasApertureRegs, SupportsGetDoorbellID,
+                              HasArchitectedSGPRs, COV);
 
       if (AttrMask == UNKNOWN_INTRINSIC) {
         // Assume not-nocallback intrinsics may invoke a function which accesses

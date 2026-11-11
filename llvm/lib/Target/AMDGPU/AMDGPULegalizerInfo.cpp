@@ -8280,11 +8280,28 @@ bool AMDGPULegalizerInfo::legalizeStackSave(MachineInstr &MI,
 
 bool AMDGPULegalizerInfo::legalizeWaveID(MachineInstr &MI,
                                          MachineIRBuilder &B) const {
-  // With architected SGPRs, waveIDinGroup is in TTMP8[29:25].
-  if (!ST.hasArchitectedSGPRs())
-    return false;
   LLT I32 = LLT::integer(32);
   Register DstReg = MI.getOperand(0).getReg();
+  if (!ST.hasArchitectedSGPRs()) {
+    // Without architected SGPRs, compute the wave ID from the X workitem ID.
+    // This is only valid when the workgroup is one-dimensional.
+    const Function &F = B.getMF().getFunction();
+    if (ST.getMaxWorkitemID(F, 1) != 0 || ST.getMaxWorkitemID(F, 2) != 0)
+      return false;
+    unsigned WaveSizeLog2 = ST.getWavefrontSizeLog2();
+    unsigned MaxWaveID = ST.getMaxWorkitemID(F, 0) >> WaveSizeLog2;
+    if (MaxWaveID == 0)
+      return replaceWithConstant(B, MI, 0);
+    auto TID = B.buildIntrinsic(Intrinsic::amdgcn_workitem_id_x, {I32});
+    auto WaveID = B.buildLShr(I32, TID, B.buildConstant(I32, WaveSizeLog2));
+    // Every lane of a wave has the same value. Make it uniform.
+    auto Uniform = B.buildIntrinsic(Intrinsic::amdgcn_readfirstlane, {I32})
+                       .addUse(WaveID.getReg(0));
+    B.buildAssertZExt(DstReg, Uniform, llvm::bit_width(MaxWaveID));
+    MI.eraseFromParent();
+    return true;
+  }
+  // With architected SGPRs, waveIDinGroup is in TTMP8[29:25].
   auto TTMP8 = B.buildCopy(I32, Register(AMDGPU::TTMP8));
   auto LSB = B.buildConstant(I32, 25);
   auto Width = B.buildConstant(I32, 5);

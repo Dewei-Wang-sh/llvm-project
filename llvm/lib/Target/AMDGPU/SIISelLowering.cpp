@@ -11085,11 +11085,35 @@ SDValue SITargetLowering::lowerSBuffer(EVT VT, EVT MemVT, SDLoc DL,
 }
 
 SDValue SITargetLowering::lowerWaveID(SelectionDAG &DAG, SDValue Op) const {
-  // With architected SGPRs, waveIDinGroup is in TTMP8[29:25].
-  if (!Subtarget->hasArchitectedSGPRs())
-    return {};
   SDLoc SL(Op);
   MVT VT = MVT::i32;
+  if (!Subtarget->hasArchitectedSGPRs()) {
+    // Without architected SGPRs, compute the wave ID from the X workitem ID.
+    // This is only valid when the workgroup is one-dimensional.
+    MachineFunction &MF = DAG.getMachineFunction();
+    const Function &F = MF.getFunction();
+    if (Subtarget->getMaxWorkitemID(F, 1) != 0 ||
+        Subtarget->getMaxWorkitemID(F, 2) != 0)
+      return {};
+    unsigned WaveSizeLog2 = Subtarget->getWavefrontSizeLog2();
+    unsigned MaxWaveID = Subtarget->getMaxWorkitemID(F, 0) >> WaveSizeLog2;
+    if (MaxWaveID == 0)
+      return DAG.getConstant(0, SL, VT);
+    const SIMachineFunctionInfo *MFI = MF.getInfo<SIMachineFunctionInfo>();
+    SDValue TID = lowerWorkitemID(DAG, Op, 0, MFI->getArgInfo().WorkItemIDX);
+    SDValue WaveID = DAG.getNode(ISD::SRL, SL, VT, TID,
+                                 DAG.getConstant(WaveSizeLog2, SL, VT));
+    // Every lane of a wave has the same value. Make it uniform.
+    WaveID = DAG.getNode(
+        ISD::INTRINSIC_WO_CHAIN, SL, VT,
+        DAG.getTargetConstant(Intrinsic::amdgcn_readfirstlane, SL, MVT::i32),
+        WaveID);
+    EVT SmallVT =
+        EVT::getIntegerVT(*DAG.getContext(), llvm::bit_width(MaxWaveID));
+    return DAG.getNode(ISD::AssertZext, SL, VT, WaveID,
+                       DAG.getValueType(SmallVT));
+  }
+  // With architected SGPRs, waveIDinGroup is in TTMP8[29:25].
   SDValue TTMP8 = DAG.getCopyFromReg(DAG.getEntryNode(), SL, AMDGPU::TTMP8, VT);
   return DAG.getNode(AMDGPUISD::BFE_U32, SL, VT, TTMP8,
                      DAG.getConstant(25, SL, VT), DAG.getConstant(5, SL, VT));
