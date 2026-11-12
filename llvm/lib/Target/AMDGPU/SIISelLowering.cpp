@@ -56,6 +56,60 @@
 #include <optional>
 
 using namespace llvm;
+
+// PlumbCompiler: select element-wise vector ops and reductions on 2/4/8/16 x
+// 32-bit lanes to SI_VECTOR_* pseudos, so the vector form survives until the
+// pre-RA machine scheduler. Nothing expands the pseudos yet, so this is only
+// valid when compilation stops at or before that scheduler.
+cl::opt<bool> llvm::EnableAMDGPUVectorPseudos(
+    "amdgpu-vector-pseudos",
+    cl::desc("Keep vector ops and reductions as SI_VECTOR_* pseudos until the "
+             "pre-RA machine scheduler (no expansion yet)"),
+    cl::init(false), cl::Hidden);
+
+// SI_VECTOR_* pseudo for ISD opcode `Opc` on `NumElts` 32-bit lanes, or -1.
+static int getVectorPseudoOpcode(unsigned Opc, unsigned NumElts) {
+#define VEC_PSEUDO(ISDOPC, NAME, SUFFIX)                                       \
+  case ISDOPC:                                                                 \
+    switch (NumElts) {                                                         \
+    case 2:                                                                    \
+      return AMDGPU::SI_VECTOR_##NAME##_V2##SUFFIX;                            \
+    case 4:                                                                    \
+      return AMDGPU::SI_VECTOR_##NAME##_V4##SUFFIX;                            \
+    case 8:                                                                    \
+      return AMDGPU::SI_VECTOR_##NAME##_V8##SUFFIX;                            \
+    case 16:                                                                   \
+      return AMDGPU::SI_VECTOR_##NAME##_V16##SUFFIX;                           \
+    default:                                                                   \
+      return -1;                                                               \
+    }
+  switch (Opc) {
+    VEC_PSEUDO(ISD::FMUL, FMUL, F32)
+    VEC_PSEUDO(ISD::FSUB, FSUB, F32)
+    VEC_PSEUDO(ISD::FEXP2, EXP2, F32)
+    VEC_PSEUDO(ISD::FP_ROUND, FPTRUNC, F32_BF16)
+    VEC_PSEUDO(ISD::VECREDUCE_FADD, REDUCE_FADD, F32)
+    VEC_PSEUDO(ISD::VECREDUCE_SEQ_FADD, REDUCE_SEQ_FADD, F32)
+    VEC_PSEUDO(ISD::VECREDUCE_FMAX, REDUCE_FMAX, F32)
+    VEC_PSEUDO(ISD::ADD, ADD, I32)
+    VEC_PSEUDO(ISD::MUL, MUL, I32)
+    VEC_PSEUDO(ISD::SHL, SHL, I32)
+    VEC_PSEUDO(ISD::OR, OR, I32)
+    VEC_PSEUDO(ISD::VSELECT, ICMP_SELECT, B32)
+  default:
+    return -1;
+  }
+#undef VEC_PSEUDO
+}
+
+// Number of lanes if `VT` is a 2/4/8/16-element vector of 32-bit elements.
+static unsigned getVectorPseudoLanes(EVT VT) {
+  if (!VT.isSimple() || !VT.isFixedLengthVector() ||
+      VT.getScalarSizeInBits() != 32)
+    return 0;
+  unsigned N = VT.getVectorNumElements();
+  return (N == 2 || N == 4 || N == 8 || N == 16) ? N : 0;
+}
 using namespace llvm::SDPatternMatch;
 
 #define DEBUG_TYPE "si-lower"
@@ -1198,6 +1252,21 @@ SITargetLowering::SITargetLowering(const TargetMachine &TM,
 
   // All memory operations. Some folding on the pointer operand is done to help
   // matching the constant offsets in the addressing modes.
+  if (EnableAMDGPUVectorPseudos) {
+    for (MVT VT : {MVT::v2f32, MVT::v4f32, MVT::v8f32, MVT::v16f32})
+      setOperationAction({ISD::FMUL, ISD::FSUB, ISD::FEXP2,
+                          ISD::VECREDUCE_FADD, ISD::VECREDUCE_SEQ_FADD,
+                          ISD::VECREDUCE_FMAX},
+                         VT, Custom);
+    // FP_ROUND's action is keyed on its (bf16) result type.
+    for (MVT VT : {MVT::v2bf16, MVT::v4bf16, MVT::v8bf16, MVT::v16bf16})
+      setOperationAction(ISD::FP_ROUND, VT, Custom);
+    for (MVT VT : {MVT::v2i32, MVT::v4i32, MVT::v8i32, MVT::v16i32})
+      setOperationAction({ISD::ADD, ISD::MUL, ISD::SHL, ISD::OR}, VT, Custom);
+    // vselect(setcc) is fused before type legalization splits the i1 mask.
+    setTargetDAGCombine(ISD::VSELECT);
+  }
+
   setTargetDAGCombine({ISD::LOAD,
                        ISD::STORE,
                        ISD::ATOMIC_LOAD,
@@ -7749,7 +7818,89 @@ SDValue SITargetLowering::splitTernaryVectorOp(SDValue Op,
   return DAG.getNode(ISD::CONCAT_VECTORS, SDLoc(Op), VT, OpLo, OpHi);
 }
 
+SDValue SITargetLowering::lowerToVectorPseudo(SDValue Op,
+                                              SelectionDAG &DAG) const {
+  unsigned Opc = Op.getOpcode();
+  SDLoc DL(Op);
+  EVT VT = Op.getValueType();
+  switch (Opc) {
+  case ISD::FMUL:
+  case ISD::FSUB:
+  case ISD::FEXP2:
+  case ISD::ADD:
+  case ISD::MUL:
+  case ISD::SHL:
+  case ISD::OR: {
+    int PseudoOpc = getVectorPseudoOpcode(Opc, getVectorPseudoLanes(VT));
+    if (PseudoOpc < 0)
+      return SDValue();
+    SmallVector<SDValue, 2> Ops(Op->op_begin(), Op->op_end());
+    return SDValue(DAG.getMachineNode(PseudoOpc, DL, VT, Ops), 0);
+  }
+  case ISD::FP_ROUND: {
+    SDValue Src = Op.getOperand(0);
+    if (Src.getValueType().getScalarType() != MVT::f32 ||
+        VT.getScalarType() != MVT::bf16)
+      return SDValue();
+    int PseudoOpc =
+        getVectorPseudoOpcode(Opc, getVectorPseudoLanes(Src.getValueType()));
+    if (PseudoOpc < 0)
+      return SDValue();
+    return SDValue(DAG.getMachineNode(PseudoOpc, DL, VT, Src), 0);
+  }
+  case ISD::VECREDUCE_FADD:
+  case ISD::VECREDUCE_FMAX: {
+    SDValue Src = Op.getOperand(0);
+    int PseudoOpc =
+        getVectorPseudoOpcode(Opc, getVectorPseudoLanes(Src.getValueType()));
+    if (PseudoOpc < 0 || VT != MVT::f32)
+      return SDValue();
+    return SDValue(DAG.getMachineNode(PseudoOpc, DL, VT, Src), 0);
+  }
+  case ISD::VECREDUCE_SEQ_FADD: {
+    SDValue Start = Op.getOperand(0), Src = Op.getOperand(1);
+    int PseudoOpc =
+        getVectorPseudoOpcode(Opc, getVectorPseudoLanes(Src.getValueType()));
+    if (PseudoOpc < 0 || VT != MVT::f32)
+      return SDValue();
+    return SDValue(DAG.getMachineNode(PseudoOpc, DL, VT, {Start, Src}), 0);
+  }
+  default:
+    return SDValue();
+  }
+}
+
+SDValue
+SITargetLowering::combineVSelectToVectorPseudo(SDNode *N,
+                                               DAGCombinerInfo &DCI) const {
+  // Before type legalization splits the <N x i1> mask into lanes, fuse
+  // vselect(setcc(a, b, cc), t, f) on integer 32-bit lanes into one pseudo.
+  if (!DCI.isBeforeLegalize())
+    return SDValue();
+  SDValue Cond = N->getOperand(0);
+  SDValue TVal = N->getOperand(1), FVal = N->getOperand(2);
+  EVT VT = N->getValueType(0);
+  if (Cond.getOpcode() != ISD::SETCC)
+    return SDValue();
+  SDValue LHS = Cond.getOperand(0), RHS = Cond.getOperand(1);
+  ISD::CondCode CC = cast<CondCodeSDNode>(Cond.getOperand(2))->get();
+  unsigned Lanes = getVectorPseudoLanes(VT);
+  if (!Lanes || !LHS.getValueType().isInteger() ||
+      getVectorPseudoLanes(LHS.getValueType()) != Lanes ||
+      !isTypeLegal(VT) || !isTypeLegal(LHS.getValueType()))
+    return SDValue();
+  int PseudoOpc = getVectorPseudoOpcode(ISD::VSELECT, Lanes);
+  SelectionDAG &DAG = DCI.DAG;
+  SDLoc DL(N);
+  SDValue Ops[] = {LHS, RHS, TVal, FVal,
+                   DAG.getTargetConstant(CC, DL, MVT::i32)};
+  return SDValue(DAG.getMachineNode(PseudoOpc, DL, VT, Ops), 0);
+}
+
 SDValue SITargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const {
+  if (EnableAMDGPUVectorPseudos)
+    if (SDValue V = lowerToVectorPseudo(Op, DAG))
+      return V;
   switch (Op.getOpcode()) {
   default:
     return AMDGPUTargetLowering::LowerOperation(Op, DAG);
@@ -19466,6 +19617,9 @@ SDValue SITargetLowering::performSelectCombine(SDNode *N,
 
 SDValue SITargetLowering::PerformDAGCombine(SDNode *N,
                                             DAGCombinerInfo &DCI) const {
+  if (EnableAMDGPUVectorPseudos && N->getOpcode() == ISD::VSELECT)
+    if (SDValue V = combineVSelectToVectorPseudo(N, DCI))
+      return V;
   switch (N->getOpcode()) {
   case ISD::ABS:
     if (SDValue Res = promoteUniformUnaryOpToI32(SDValue(N, 0), DCI))

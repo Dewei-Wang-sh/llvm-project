@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AMDGPUTargetTransformInfo.h"
+#include "SIISelLowering.h"
 #include "AMDGPUSubtarget.h"
 #include "AMDGPUTargetMachine.h"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
@@ -1503,6 +1504,28 @@ bool GCNTTIImpl::isSourceOfDivergence(const Value *V) const {
   }
 
   return false;
+}
+
+bool GCNTTIImpl::shouldExpandReduction(const IntrinsicInst *II) const {
+  // PlumbCompiler: with -amdgpu-vector-pseudos, f32 fadd/fmax reductions over
+  // 2/4/8/16 lanes reach instruction selection and become SI_VECTOR_REDUCE_*.
+  if (EnableAMDGPUVectorPseudos) {
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::vector_reduce_fadd:
+    case Intrinsic::vector_reduce_fmax: {
+      auto *VTy = dyn_cast<FixedVectorType>(
+          II->getArgOperand(II->arg_size() - 1)->getType());
+      unsigned N = VTy ? VTy->getNumElements() : 0;
+      if (VTy && VTy->getElementType()->isFloatTy() &&
+          (N == 2 || N == 4 || N == 8 || N == 16))
+        return false;
+      break;
+    }
+    default:
+      break;
+    }
+  }
+  return true;
 }
 
 bool GCNTTIImpl::isAlwaysUniform(const Value *V) const {

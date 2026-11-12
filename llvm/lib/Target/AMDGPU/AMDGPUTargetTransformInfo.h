@@ -109,6 +109,7 @@ class GCNTTIImpl final : public BasicTTIImplBase<GCNTTIImpl> {
   /// Returns true for the target specific set of operations which produce
   /// uniform result even taking non-uniform arguments.
   bool isAlwaysUniform(const Value *V) const;
+  bool shouldExpandReduction(const IntrinsicInst *II) const override;
 
 public:
   explicit GCNTTIImpl(const AMDGPUTargetMachine *TM, const Function &F);

@@ -14,6 +14,8 @@
 #ifndef LLVM_LIB_TARGET_AMDGPU_SIISELLOWERING_H
 #define LLVM_LIB_TARGET_AMDGPU_SIISELLOWERING_H
 
+#include "llvm/Support/CommandLine.h"
+
 #include "AMDGPUArgumentUsageInfo.h"
 #include "AMDGPUISelLowering.h"
 #include "SIDefines.h"
@@ -22,6 +24,9 @@
 #include <bitset>
 
 namespace llvm {
+
+/// PlumbCompiler: keep vector ops as SI_VECTOR_* pseudos (-amdgpu-vector-pseudos).
+extern cl::opt<bool> EnableAMDGPUVectorPseudos;
 
 class GCNSubtarget;
 class SIMachineFunctionInfo;
@@ -535,6 +540,8 @@ public:
   SDValue splitBinaryVectorOp(SDValue Op, SelectionDAG &DAG) const;
   SDValue splitTernaryVectorOp(SDValue Op, SelectionDAG &DAG) const;
   SDValue LowerOperation(SDValue Op, SelectionDAG &DAG) const override;
+  SDValue lowerToVectorPseudo(SDValue Op, SelectionDAG &DAG) const;
+  SDValue combineVSelectToVectorPseudo(SDNode *N, DAGCombinerInfo &DCI) const;
   void ReplaceNodeResults(SDNode *N, SmallVectorImpl<SDValue> &Results,
                           SelectionDAG &DAG) const override;
 

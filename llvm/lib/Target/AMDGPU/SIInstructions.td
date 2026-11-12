@@ -5207,3 +5207,44 @@ foreach inst = VGPR32_Ptr_Opcodes in {
 foreach inst = VGPR64_Ptr_Opcodes in {
   def : RemapPointerOperands<inst, VReg_64_AlignTarget>;
 }
+
+//===----------------------------------------------------------------------===//
+// PlumbCompiler: vector pseudos (-amdgpu-vector-pseudos)
+//
+// Element-wise vector operations and reductions on 2/4/8/16 x 32-bit lanes,
+// selected from vector IR so that the pre-RA machine scheduler still sees
+// the vector form. Nothing expands them yet, so a function that contains them
+// can only be compiled up to (and including) the pre-RA machine scheduler.
+//===----------------------------------------------------------------------===//
+
+let hasSideEffects = 0, mayLoad = 0, mayStore = 0, Uses = [MODE, EXEC] in {
+foreach N = [2, 4, 8, 16] in {
+  defvar RC = !cond(!eq(N, 2) : VReg_64, !eq(N, 4) : VReg_128,
+                    !eq(N, 8) : VReg_256, !eq(N, 16) : VReg_512);
+  // N x 16-bit (bf16) results of SI_VECTOR_FPTRUNC.
+  defvar HalfRC = !cond(!eq(N, 2) : VGPR_32, !eq(N, 4) : VReg_64,
+                        !eq(N, 8) : VReg_128, !eq(N, 16) : VReg_256);
+
+  // Element-wise f32.
+  def SI_VECTOR_FMUL_V#N#F32 : VPseudoInstSI<(outs RC:$vdst), (ins RC:$src0, RC:$src1)>;
+  def SI_VECTOR_FSUB_V#N#F32 : VPseudoInstSI<(outs RC:$vdst), (ins RC:$src0, RC:$src1)>;
+  def SI_VECTOR_EXP2_V#N#F32 : VPseudoInstSI<(outs RC:$vdst), (ins RC:$src0)>;
+  def SI_VECTOR_FPTRUNC_V#N#F32_BF16 : VPseudoInstSI<(outs HalfRC:$vdst), (ins RC:$src0)>;
+
+  // Reductions to one f32 (FADD: any order; SEQ_FADD: in element order).
+  def SI_VECTOR_REDUCE_FADD_V#N#F32 : VPseudoInstSI<(outs VGPR_32:$vdst), (ins RC:$src0)>;
+  def SI_VECTOR_REDUCE_SEQ_FADD_V#N#F32 : VPseudoInstSI<(outs VGPR_32:$vdst), (ins VGPR_32:$start, RC:$src0)>;
+  def SI_VECTOR_REDUCE_FMAX_V#N#F32 : VPseudoInstSI<(outs VGPR_32:$vdst), (ins RC:$src0)>;
+
+  // Element-wise i32.
+  def SI_VECTOR_ADD_V#N#I32 : VPseudoInstSI<(outs RC:$vdst), (ins RC:$src0, RC:$src1)>;
+  def SI_VECTOR_MUL_V#N#I32 : VPseudoInstSI<(outs RC:$vdst), (ins RC:$src0, RC:$src1)>;
+  def SI_VECTOR_SHL_V#N#I32 : VPseudoInstSI<(outs RC:$vdst), (ins RC:$src0, RC:$src1)>;
+  def SI_VECTOR_OR_V#N#I32 : VPseudoInstSI<(outs RC:$vdst), (ins RC:$src0, RC:$src1)>;
+
+  // Fused compare + select: vdst[i] = (src0[i] <cc> src1[i]) ? tval[i] : fval[i].
+  // $cc is the ISD::CondCode of the integer compare; tval/fval are any 32-bit lanes.
+  def SI_VECTOR_ICMP_SELECT_V#N#B32 : VPseudoInstSI<(outs RC:$vdst),
+      (ins RC:$src0, RC:$src1, RC:$tval, RC:$fval, i32imm:$cc)>;
+}
+} // End let hasSideEffects = 0, mayLoad = 0, mayStore = 0, Uses = [MODE, EXEC]
