@@ -102,6 +102,69 @@ static int getVectorPseudoOpcode(unsigned Opc, unsigned NumElts) {
 #undef VEC_PSEUDO
 }
 
+// "Vector op scalar" SI_VECTOR_*_VS pseudo for binary ISD opcode `Opc` on
+// `NumElts` 32-bit lanes, or -1.
+static int getVectorScalarPseudoOpcode(unsigned Opc, unsigned NumElts) {
+#define VEC_PSEUDO_VS(ISDOPC, NAME, SUFFIX)                                    \
+  case ISDOPC:                                                                 \
+    switch (NumElts) {                                                         \
+    case 2:                                                                    \
+      return AMDGPU::SI_VECTOR_##NAME##_V2##SUFFIX##_VS;                       \
+    case 4:                                                                    \
+      return AMDGPU::SI_VECTOR_##NAME##_V4##SUFFIX##_VS;                       \
+    case 8:                                                                    \
+      return AMDGPU::SI_VECTOR_##NAME##_V8##SUFFIX##_VS;                       \
+    case 16:                                                                   \
+      return AMDGPU::SI_VECTOR_##NAME##_V16##SUFFIX##_VS;                      \
+    default:                                                                   \
+      return -1;                                                               \
+    }
+  switch (Opc) {
+    VEC_PSEUDO_VS(ISD::FMUL, FMUL, F32)
+    VEC_PSEUDO_VS(ISD::FSUB, FSUB, F32)
+    VEC_PSEUDO_VS(ISD::ADD, ADD, I32)
+    VEC_PSEUDO_VS(ISD::MUL, MUL, I32)
+    VEC_PSEUDO_VS(ISD::SHL, SHL, I32)
+    VEC_PSEUDO_VS(ISD::OR, OR, I32)
+  default:
+    return -1;
+  }
+#undef VEC_PSEUDO_VS
+}
+
+// SI_VECTOR_ICMP_SELECT pseudo on `NumElts` lanes, with a scalar compare RHS
+// (`ScalarRHS`) and/or a scalar false value (`ScalarFVal`).
+static unsigned getVectorICmpSelectPseudoOpcode(unsigned NumElts,
+                                                bool ScalarRHS,
+                                                bool ScalarFVal) {
+#define VEC_ICMP_SELECT(N)                                                     \
+  case N:                                                                      \
+    if (ScalarRHS && ScalarFVal)                                               \
+      return AMDGPU::SI_VECTOR_ICMP_SELECT_V##N##B32_VSVS;                     \
+    if (ScalarRHS)                                                             \
+      return AMDGPU::SI_VECTOR_ICMP_SELECT_V##N##B32_VSVV;                     \
+    if (ScalarFVal)                                                            \
+      return AMDGPU::SI_VECTOR_ICMP_SELECT_V##N##B32_VVVS;                     \
+    return AMDGPU::SI_VECTOR_ICMP_SELECT_V##N##B32;
+  switch (NumElts) {
+    VEC_ICMP_SELECT(2)
+    VEC_ICMP_SELECT(4)
+    VEC_ICMP_SELECT(8)
+    VEC_ICMP_SELECT(16)
+  default:
+    llvm_unreachable("unsupported lane count");
+  }
+#undef VEC_ICMP_SELECT
+}
+
+// The scalar that `V` splats to every lane, or an empty SDValue.
+static SDValue getVectorPseudoSplat(SelectionDAG &DAG, SDValue V) {
+  SDValue S = DAG.getSplatValue(V);
+  if (S && S.getValueType() == V.getValueType().getVectorElementType())
+    return S;
+  return SDValue();
+}
+
 // Number of lanes if `VT` is a 2/4/8/16-element vector of 32-bit elements.
 static unsigned getVectorPseudoLanes(EVT VT) {
   if (!VT.isSimple() || !VT.isFixedLengthVector() ||
@@ -7826,11 +7889,28 @@ SDValue SITargetLowering::lowerToVectorPseudo(SDValue Op,
   switch (Opc) {
   case ISD::FMUL:
   case ISD::FSUB:
-  case ISD::FEXP2:
   case ISD::ADD:
   case ISD::MUL:
   case ISD::SHL:
   case ISD::OR: {
+    // Vector op scalar: pass a splat operand as its one 32-bit value. The
+    // scalar must be the second source, so commutative ops may be swapped.
+    unsigned Lanes = getVectorPseudoLanes(VT);
+    if (!Lanes)
+      return SDValue();
+    SDValue A = Op.getOperand(0), B = Op.getOperand(1);
+    SDValue S = getVectorPseudoSplat(DAG, B);
+    if (!S && isCommutativeBinOp(Opc)) {
+      S = getVectorPseudoSplat(DAG, A);
+      A = B;
+    }
+    if (S)
+      return SDValue(DAG.getMachineNode(getVectorScalarPseudoOpcode(Opc, Lanes),
+                                        DL, VT, {A, S}),
+                     0);
+    [[fallthrough]];
+  }
+  case ISD::FEXP2: {
     int PseudoOpc = getVectorPseudoOpcode(Opc, getVectorPseudoLanes(VT));
     if (PseudoOpc < 0)
       return SDValue();
@@ -7889,10 +7969,29 @@ SITargetLowering::combineVSelectToVectorPseudo(SDNode *N,
       getVectorPseudoLanes(LHS.getValueType()) != Lanes ||
       !isTypeLegal(VT) || !isTypeLegal(LHS.getValueType()))
     return SDValue();
-  int PseudoOpc = getVectorPseudoOpcode(ISD::VSELECT, Lanes);
   SelectionDAG &DAG = DCI.DAG;
   SDLoc DL(N);
-  SDValue Ops[] = {LHS, RHS, TVal, FVal,
+  // Vector op scalar: a splat compare operand goes to src1 (swapping the
+  // compare) and a splat select value to fval (inverting the compare), each
+  // passed as its one 32-bit value.
+  SDValue RHSScalar = getVectorPseudoSplat(DAG, RHS);
+  if (!RHSScalar) {
+    if ((RHSScalar = getVectorPseudoSplat(DAG, LHS))) {
+      LHS = RHS;
+      CC = ISD::getSetCCSwappedOperands(CC);
+    }
+  }
+  SDValue FValScalar = getVectorPseudoSplat(DAG, FVal);
+  if (!FValScalar) {
+    if ((FValScalar = getVectorPseudoSplat(DAG, TVal))) {
+      TVal = FVal;
+      CC = ISD::getSetCCInverse(CC, LHS.getValueType());
+    }
+  }
+  unsigned PseudoOpc =
+      getVectorICmpSelectPseudoOpcode(Lanes, !!RHSScalar, !!FValScalar);
+  SDValue Ops[] = {LHS, RHSScalar ? RHSScalar : RHS, TVal,
+                   FValScalar ? FValScalar : FVal,
                    DAG.getTargetConstant(CC, DL, MVT::i32)};
   return SDValue(DAG.getMachineNode(PseudoOpc, DL, VT, Ops), 0);
 }

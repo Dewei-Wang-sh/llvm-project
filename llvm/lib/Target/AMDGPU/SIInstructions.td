@@ -5246,5 +5246,25 @@ foreach N = [2, 4, 8, 16] in {
   // $cc is the ISD::CondCode of the integer compare; tval/fval are any 32-bit lanes.
   def SI_VECTOR_ICMP_SELECT_V#N#B32 : VPseudoInstSI<(outs RC:$vdst),
       (ins RC:$src0, RC:$src1, RC:$tval, RC:$fval, i32imm:$cc)>;
+
+  // "Vector op scalar" forms: a splat operand is passed as one 32-bit value
+  // (VGPR, SGPR or immediate) used for every lane, instead of a register
+  // tuple. The suffix gives each source's form in order: V = tuple, S = scalar.
+  // The scalar is always the last source of a binary op; the lowering swaps
+  // commutative operands to get there.
+  def SI_VECTOR_FMUL_V#N#F32_VS : VPseudoInstSI<(outs RC:$vdst), (ins RC:$src0, VSrc_f32:$src1)>;
+  def SI_VECTOR_FSUB_V#N#F32_VS : VPseudoInstSI<(outs RC:$vdst), (ins RC:$src0, VSrc_f32:$src1)>;
+  def SI_VECTOR_ADD_V#N#I32_VS : VPseudoInstSI<(outs RC:$vdst), (ins RC:$src0, VSrc_b32:$src1)>;
+  def SI_VECTOR_MUL_V#N#I32_VS : VPseudoInstSI<(outs RC:$vdst), (ins RC:$src0, VSrc_b32:$src1)>;
+  def SI_VECTOR_SHL_V#N#I32_VS : VPseudoInstSI<(outs RC:$vdst), (ins RC:$src0, VSrc_b32:$src1)>;
+  def SI_VECTOR_OR_V#N#I32_VS : VPseudoInstSI<(outs RC:$vdst), (ins RC:$src0, VSrc_b32:$src1)>;
+  // ICMP_SELECT with a scalar compare RHS and/or a scalar false value; the
+  // lowering swaps the compare or the select arms to get scalars there.
+  def SI_VECTOR_ICMP_SELECT_V#N#B32_VSVV : VPseudoInstSI<(outs RC:$vdst),
+      (ins RC:$src0, VSrc_b32:$src1, RC:$tval, RC:$fval, i32imm:$cc)>;
+  def SI_VECTOR_ICMP_SELECT_V#N#B32_VVVS : VPseudoInstSI<(outs RC:$vdst),
+      (ins RC:$src0, RC:$src1, RC:$tval, VSrc_b32:$fval, i32imm:$cc)>;
+  def SI_VECTOR_ICMP_SELECT_V#N#B32_VSVS : VPseudoInstSI<(outs RC:$vdst),
+      (ins RC:$src0, VSrc_b32:$src1, RC:$tval, VSrc_b32:$fval, i32imm:$cc)>;
 }
 } // End let hasSideEffects = 0, mayLoad = 0, mayStore = 0, Uses = [MODE, EXEC]
